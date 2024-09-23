@@ -1,0 +1,186 @@
+version: '3.8'
+
+services:
+  traefik:
+    image: traefik:v3.0
+    command:
+      - "--providers.docker=true"
+      - "--providers.docker.exposedbydefault=false"
+      - "--entrypoints.web.address=:80"
+      - "--entrypoints.websecure.address=:443"
+      - "--entrypoints.dns-tcp.address=:53"
+      - "--entrypoints.dns-udp.address=:53/udp"
+      - "--entrypoints.dns-tls.address=:853"
+      - "--api=true"
+      - "--api.dashboard=true"
+      - "--log.level=WARNING"
+      - "--accesslog=true"
+      - "--accesslog.filepath=/var/log/traefik/access.log"
+      - "--metrics.prometheus=true"
+      - "--metrics.prometheus.buckets=0.1,0.3,1.2,5.0"
+      - "--providers.file.directory=/etc/traefik/dynamic_conf"
+      - "--certificatesresolvers.myresolver.acme.dnschallenge=true"
+      - "--certificatesresolvers.myresolver.acme.dnschallenge.provider=cloudflare"
+      - "--certificatesresolvers.myresolver.acme.email=${EMAIL}"
+      - "--certificatesresolvers.myresolver.acme.storage=/letsencrypt/acme.json"
+    ports:
+      - "80:80"
+      - "443:443"
+      - "53:53"
+      - "53:53/udp"
+      - "853:853"
+    environment:
+      - CF_API_EMAIL=${CF_API_EMAIL}
+      - CF_API_KEY=${CF_API_KEY}
+    volumes:
+      - "/var/run/docker.sock:/var/run/docker.sock:ro"
+      - "./traefik:/etc/traefik"
+      - "./letsencrypt:/letsencrypt"
+      - "./logs/traefik:/var/log/traefik"
+    networks:
+      - proxy
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.traefik.rule=Host(`traefik.${DOMAIN}`)"
+      - "traefik.http.routers.traefik.entrypoints=websecure"
+      - "traefik.http.routers.traefik.tls.certresolver=myresolver"
+      - "traefik.http.routers.traefik.service=api@internal"
+      - "traefik.http.routers.traefik.middlewares=traefik-auth"
+      - "traefik.http.middlewares.traefik-auth.basicauth.users=${TRAEFIK_USER}:${TRAEFIK_PASSWORD}"
+    security_opt:
+      - no-new-privileges:true
+
+  dnsmasq:
+    build:
+      context: ./dnsmasq
+      dockerfile: Dockerfile
+    volumes:
+      - "./dnsmasq/dnsmasq.conf:/etc/dnsmasq.conf:ro"
+    networks:
+      - proxy
+    labels:
+      - "traefik.enable=true"
+      - "traefik.tcp.routers.dnsmasq.rule=HostSNI(`*`)"
+      - "traefik.tcp.routers.dnsmasq.entrypoints=dns-tcp"
+      - "traefik.tcp.services.dnsmasq.loadbalancer.server.port=53"
+      - "traefik.udp.routers.dnsmasq-udp.entrypoints=dns-udp"
+      - "traefik.udp.routers.dnsmasq-udp.service=dnsmasq-udp"
+      - "traefik.udp.services.dnsmasq-udp.loadbalancer.server.port=53"
+
+  stunnel:
+    build:
+      context: ./stunnel
+      dockerfile: Dockerfile
+    volumes:
+      - "./stunnel/stunnel.conf:/etc/stunnel/stunnel.conf:ro"
+    networks:
+      - proxy
+    labels:
+      - "traefik.enable=true"
+      - "traefik.tcp.routers.stunnel.rule=HostSNI(`*`)"
+      - "traefik.tcp.routers.stunnel.entrypoints=dns-tls"
+      - "traefik.tcp.services.stunnel.loadbalancer.server.port=853"
+
+  prometheus:
+    image: prom/prometheus:latest
+    volumes:
+      - "./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro"
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/usr/share/prometheus/console_libraries'
+      - '--web.console.templates=/usr/share/prometheus/consoles'
+    networks:
+      - proxy
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.prometheus.rule=Host(`prometheus.${DOMAIN}`)"
+      - "traefik.http.routers.prometheus.entrypoints=websecure"
+      - "traefik.http.routers.prometheus.tls.certresolver=myresolver"
+      - "traefik.http.routers.prometheus.middlewares=prometheus-auth"
+      - "traefik.http.middlewares.prometheus-auth.basicauth.users=${PROM_USER}:${PROM_PASSWORD}"
+
+  dns-dashboard:
+    build:
+      context: ./dns-dashboard
+      dockerfile: Dockerfile
+    environment:
+      - GOTIFY_URL=${GOTIFY_URL}
+      - GOTIFY_TOKEN=${GOTIFY_TOKEN}
+      - DOMAIN=${DOMAIN}
+    volumes:
+      - "./logs/traefik:/app/traefik_logs:ro"
+    networks:
+      - proxy
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.dashboard.rule=Host(`dashboard.${DOMAIN}`)"
+      - "traefik.http.routers.dashboard.entrypoints=websecure"
+      - "traefik.http.routers.dashboard.tls.certresolver=myresolver"
+      - "traefik.http.services.dashboard.loadbalancer.server.port=3000"
+      - "traefik.http.routers.dashboard.middlewares=dashboard-auth"
+      - "traefik.http.middlewares.dashboard-auth.basicauth.users=${DASHBOARD_USER}:${DASHBOARD_PASSWORD}"
+
+  crowdsec:
+    image: crowdsecurity/crowdsec:latest
+    environment:
+      COLLECTIONS: "crowdsecurity/traefik"
+    volumes:
+      - ./crowdsec/config:/etc/crowdsec
+      - ./crowdsec/data:/var/lib/crowdsec/data
+      - ./crowdsec/acquis.yaml:/etc/crowdsec/acquis.yaml
+    networks:
+      - proxy
+
+  crowdsec-traefik-bouncer:
+    image: docker.io/fbonalair/traefik-crowdsec-bouncer:latest
+    environment:
+      CROWDSEC_BOUNCER_API_KEY: ${CROWDSEC_API_KEY}
+      CROWDSEC_AGENT_HOST: crowdsec:8080
+    networks:
+      - proxy
+    depends_on:
+      - crowdsec
+
+  diun:
+    image: crazymax/diun:latest
+    command: serve
+    volumes:
+      - ./diun:/data
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      TZ: Asia/Tehran
+      DIUN_WATCH_SCHEDULE: "0 */6 * * *"
+      DIUN_PROVIDERS_DOCKER: "true"
+      DIUN_PROVIDERS_DOCKER_WATCHBYDEFAULT: "true"
+      LOG_LEVEL: "info"
+      DIUN_WATCH_WORKERS: 20
+      DIUN_WATCH_JITTER: 30s
+      DIUN_WATCH_RUNONSTARTUP: "true"
+      DIUN_NOTIF_GOTIFY_ENDPOINT: ${GOTIFY_URL}
+      DIUN_NOTIF_GOTIFY_TOKEN: ${GOTIFY_TOKEN}
+      DIUN_NOTIF_GOTIFY_PRIORITY: 5
+      DIUN_NOTIF_GOTIFY_TIMEOUT: 10s
+    networks:
+      - proxy
+
+  crontab:
+    image: alpine:latest
+    volumes:
+      - ./logs:/logs
+      - ./cleanup-logs.sh:/cleanup-logs.sh
+    command: >
+      /bin/sh -c "
+        echo '0 2 * * * /cleanup-logs.sh' > /etc/crontabs/root &&
+        crond -f -d 8
+      "
+    networks:
+      - proxy
+
+networks:
+  proxy:
+    driver: bridge
+
+volumes:
+  prometheus_data:
